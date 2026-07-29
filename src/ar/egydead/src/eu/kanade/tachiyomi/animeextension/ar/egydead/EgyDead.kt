@@ -5,6 +5,7 @@ import androidx.preference.PreferenceScreen
 import aniyomi.lib.doodextractor.DoodExtractor
 import aniyomi.lib.mixdropextractor.MixDropExtractor
 import aniyomi.lib.streamwishextractor.StreamWishExtractor
+import aniyomi.lib.voeextractor.VoeExtractor
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -122,6 +123,7 @@ class EgyDead :
 
     // ================================== video urls ==================================
     private val streamWishExtractor by lazy { StreamWishExtractor(client, headers) }
+    private val voeExtractor by lazy { VoeExtractor(client, headers) }
 
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
         val originalUrl = baseUrl.toHttpUrl().resolve(episode.url)
@@ -168,8 +170,8 @@ class EgyDead :
         println("EgyDead: server candidate count=${candidates.size}")
         println("EgyDead: detected host domains=${candidates.map { it.host }.distinct().joinToString()}")
         val videos = candidates.parallelCatchingFlatMap {
-            extractVideos(it.toString(), playbackHeaders)
-        }
+            extractVideos(it, playbackHeaders)
+        }.distinctBy { it.videoUrl }
         println("EgyDead: final Video count=${videos.size}")
         return videos
     }
@@ -213,51 +215,82 @@ class EgyDead :
         return candidates
     }
 
-    private suspend fun extractVideos(url: String, playbackHeaders: okhttp3.Headers): List<Video> = when {
-        DOOD_REGEX.containsMatchIn(url) -> {
-            DoodExtractor(client).videoFromUrl(url, "Dood mirror")?.let(::listOf)
+    private suspend fun extractVideos(url: HttpUrl, playbackHeaders: okhttp3.Headers): List<Video> {
+        val host = url.host
+        val urlString = url.toString()
+        val directMediaPath = url.encodedPath.lowercase()
+        println("EgyDead: extracting host=$host")
+
+        val route = when {
+            directMediaPath.endsWith(".m3u8") || directMediaPath.endsWith(".mp4") -> "direct"
+            MIXDROP_HOSTS.any { host == it || host.endsWith(".$it") } -> "mixdrop"
+            host == VOE_HOST || host.endsWith(".$VOE_HOST") -> "voe"
+            DOOD_REGEX.containsMatchIn(urlString) || host == DSVPLAY_HOST || host.endsWith(".$DSVPLAY_HOST") -> "dood"
+            urlString.contains("ahvsh") -> "streamhide"
+            STREAMWISH_REGEX.containsMatchIn(urlString) -> "streamwish"
+            urlString.contains("fanakishtuna") -> "fanakishtuna"
+            urlString.contains("uqload") -> "uqload"
+            else -> null
         }
 
-        url.contains("mdbekjwqa") -> {
-            MixDropExtractor(client).videoFromUrl(url, referer = playbackHeaders["Referer"].orEmpty())
+        if (route == null) {
+            println("EgyDead: extractor route=unsupported")
+            println("EgyDead: unsupported candidate host=$host")
+            println("EgyDead: extracted video count=0")
+            return emptyList()
         }
 
-        url.contains("ahvsh") -> {
-            val request = client.newCall(GET(url, playbackHeaders)).awaitSuccess().useAsJsoup()
-            val script = request.selectFirst("script:containsData(sources)")?.data()
-            val streamLink = script?.let {
-                Regex("sources:\\s*\\[\\{\\s*\\t*file:\\s*[\"']([^\"']+)").find(it)?.groupValues?.getOrNull(1)
+        println("EgyDead: extractor route=$route")
+        val videos = try {
+            when (route) {
+                "direct" -> listOf(Video(urlString, "Direct", urlString, playbackHeaders))
+                "mixdrop" -> MixDropExtractor(client).videoFromUrl(
+                    urlString,
+                    referer = playbackHeaders["Referer"].orEmpty(),
+                )
+                "voe" -> voeExtractor.videosFromUrl(urlString)
+                "dood" -> DoodExtractor(client).videoFromUrl(urlString, "Dood mirror")?.let(::listOf).orEmpty()
+                "streamhide" -> {
+                    val request = client.newCall(GET(urlString, playbackHeaders)).awaitSuccess().useAsJsoup()
+                    val script = request.selectFirst("script:containsData(sources)")?.data()
+                    val streamLink = script?.let {
+                        Regex("sources:\\s*\\[\\{\\s*\\t*file:\\s*[\"']([^\"']+)").find(it)?.groupValues?.getOrNull(1)
+                    }
+                    val quality = script?.let {
+                        Regex("'qualityLabels'\\s*:\\s*\\{\\s*\".*?\"\\s*:\\s*\"(.*?)\"").find(it)?.groupValues?.getOrNull(1)
+                    } ?: "Mirror"
+                    streamLink?.let { listOf(Video(it, "StreamHide: $quality", it, playbackHeaders)) }.orEmpty()
+                }
+                "streamwish" -> streamWishExtractor.videosFromUrl(urlString)
+                "fanakishtuna" -> {
+                    val request = client.newCall(GET(urlString, playbackHeaders)).awaitSuccess().useAsJsoup()
+                    val data = request.selectFirst("script:containsData(sources)")?.data()
+                    val streamLink = data?.let {
+                        Regex("sources:\\s*\\[\\{\\s*\\t*file:\\s*[\"']([^\"']+)").find(it)?.groupValues?.getOrNull(1)
+                    }
+                    streamLink?.let { listOf(Video(it, "Mirror: High Quality", it, playbackHeaders)) }.orEmpty()
+                }
+                "uqload" -> {
+                    val newURL = urlString.replace("https://uqload.co/", "https://www.uqload.co/")
+                    val request = client.newCall(GET(newURL, playbackHeaders)).awaitSuccess().useAsJsoup()
+                    val data = request.selectFirst("script:containsData(sources)")?.data()
+                    val streamLink = data?.substringAfter("sources: [\"", "")?.substringBefore("\"]", "")
+                        ?.takeIf(String::isNotBlank)
+                    streamLink?.let { listOf(Video(it, "Uqload: Mirror", it, playbackHeaders)) }.orEmpty()
+                }
+                else -> emptyList()
             }
-            val quality = script?.let {
-                Regex("'qualityLabels'\\s*:\\s*\\{\\s*\".*?\"\\s*:\\s*\"(.*?)\"").find(it)?.groupValues?.getOrNull(1)
-            } ?: "Mirror"
-            streamLink?.let { listOf(Video(it, "StreamHide: $quality", it, playbackHeaders)) }.orEmpty()
+        } catch (exception: Exception) {
+            val safeMessage = exception.message
+                ?.replace(Regex("""https?://\S+"""), "<redacted-url>")
+                ?: "no message"
+            println("EgyDead: extractor failed host=$host error=${exception.javaClass.simpleName}: $safeMessage")
+            emptyList()
         }
 
-        STREAMWISH_REGEX.containsMatchIn(url) -> {
-            streamWishExtractor.videosFromUrl(url)
-        }
-
-        url.contains("fanakishtuna") -> {
-            val request = client.newCall(GET(url, playbackHeaders)).awaitSuccess().useAsJsoup()
-            val data = request.selectFirst("script:containsData(sources)")?.data()
-            val streamLink = data?.let {
-                Regex("sources:\\s*\\[\\{\\s*\\t*file:\\s*[\"']([^\"']+)").find(it)?.groupValues?.getOrNull(1)
-            }
-            streamLink?.let { listOf(Video(it, "Mirror: High Quality", it, playbackHeaders)) }.orEmpty()
-        }
-
-        url.contains("uqload") -> {
-            val newURL = url.replace("https://uqload.co/", "https://www.uqload.co/")
-            val request = client.newCall(GET(newURL, playbackHeaders)).awaitSuccess().useAsJsoup()
-            val data = request.selectFirst("script:containsData(sources)")?.data()
-            val streamLink = data?.substringAfter("sources: [\"", "")?.substringBefore("\"]", "")
-                ?.takeIf(String::isNotBlank)
-            streamLink?.let { listOf(Video(it, "Uqload: Mirror", it, playbackHeaders)) }.orEmpty()
-        }
-
-        else -> null
-    } ?: emptyList()
+        println("EgyDead: extracted video count=${videos.size}")
+        return videos
+    }
 
     override fun videoListSelector() = listOf(
         "ul.serversList li",
@@ -405,6 +438,9 @@ class EgyDead :
     companion object {
         private val DOOD_REGEX = Regex("(do*d(?:stream)?\\.(?:com?|watch|to|s[ho]|cx|la|w[sf]|pm|re|yt|stream))/[de]/([0-9a-zA-Z]+)|ds2play")
         private val STREAMWISH_REGEX = Regex("ajmidyad|alhayabambi|atabknh[ks]|https://.*\\.sbs/e/")
+        private val MIXDROP_HOSTS = setOf("mixdrop.top", "mixdrop.co", "mixdrop.to", "mixdrop.ag", "mixdrop.club", "mixdrop.ch", "mixdrop.sx", "mixdrop.bz")
+        private const val VOE_HOST = "voe.sx"
+        private const val DSVPLAY_HOST = "dsvplay.com"
         private val TRAILER_HOSTS = setOf("youtube.com", "www.youtube.com", "youtu.be", "youtube-nocookie.com")
     }
 }
