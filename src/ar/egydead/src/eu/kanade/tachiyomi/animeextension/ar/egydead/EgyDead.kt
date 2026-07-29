@@ -163,19 +163,17 @@ class EgyDead :
         return videos
     }
 
-    private fun parseServerCandidates(document: Document, watchUrl: HttpUrl): List<HttpUrl> {
-        return document.select(videoListSelector())
-            .flatMap { server ->
-                buildList {
-                    add(server.attr("data-link"))
-                    addAll(server.select("[data-link]").map { it.attr("data-link") })
-                    addAll(server.select("button[data-link]").map { it.attr("data-link") })
-                    addAll(server.select("a[href]").map { it.attr("href") })
-                }
+    private fun parseServerCandidates(document: Document, watchUrl: HttpUrl): List<HttpUrl> = document.select(videoListSelector())
+        .flatMap { server ->
+            buildList {
+                add(server.attr("data-link"))
+                addAll(server.select("[data-link]").map { it.attr("data-link") })
+                addAll(server.select("button[data-link]").map { it.attr("data-link") })
+                addAll(server.select("a[href]").map { it.attr("href") })
             }
-            .mapNotNull { raw -> raw.takeIf(String::isNotBlank)?.let(watchUrl::resolve) }
-            .distinctBy(HttpUrl::toString)
-    }
+        }
+        .mapNotNull { raw -> raw.takeIf(String::isNotBlank)?.let(watchUrl::resolve) }
+        .distinctBy(HttpUrl::toString)
 
     private suspend fun extractVideos(url: String, playbackHeaders: okhttp3.Headers): List<Video> = when {
         DOOD_REGEX.containsMatchIn(url) -> {
