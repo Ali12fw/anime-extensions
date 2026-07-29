@@ -126,24 +126,34 @@ class EgyDead :
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
         val originalUrl = baseUrl.toHttpUrl().resolve(episode.url)
             ?: return emptyList()
-        val watchUrl = originalUrl.takeIf { it.queryParameter("view") == "watch" }
-            ?: originalUrl.newBuilder().addQueryParameter("view", "watch").build()
-        val playbackHeaders = headers.newBuilder()
+        val primingHeaders = headers.newBuilder()
             .set("Referer", originalUrl.toString())
+            .build()
+        println("EgyDead: priming requested URL=$originalUrl")
+        val resolvedOriginalUrl = runCatching {
+            val primingResponse = client.newCall(GET(originalUrl, primingHeaders)).await()
+            primingResponse.use { it.request.url }
+        }.getOrElse {
+            println("EgyDead: initial episode GET failed: ${it.message}")
+            originalUrl
+        }
+        println("EgyDead: priming final URL=$resolvedOriginalUrl")
+
+        val watchUrl = resolvedOriginalUrl.newBuilder()
+            .setQueryParameter("view", "watch")
+            .build()
+        val playbackHeaders = headers.newBuilder()
+            .set("Referer", resolvedOriginalUrl.toString())
             .set("X-Requested-With", "XMLHttpRequest")
             .build()
         val requestBody = FormBody.Builder().add("View", "1").build()
 
-        println("EgyDead: requested watch URL=$watchUrl")
-        runCatching {
-            client.newCall(GET(originalUrl, playbackHeaders)).await().close()
-        }.onFailure {
-            println("EgyDead: initial episode GET failed: ${it.message}")
-        }
-
+        println("EgyDead: watch POST requested URL=$watchUrl")
         var response = runCatching {
             client.newCall(POST(watchUrl.toString(), playbackHeaders, requestBody)).await()
         }.getOrNull()
+        println("EgyDead: watch POST final URL=${response?.request?.url ?: "request failed"}")
+        println("EgyDead: watch POST final method=${response?.request?.method ?: "request failed"}")
         println("EgyDead: watch POST HTTP status=${response?.code ?: "request failed"}")
 
         var candidates = response?.use { parseServerCandidates(it.useAsJsoup(), watchUrl) }.orEmpty()
@@ -186,6 +196,11 @@ class EgyDead :
             }
         val candidates = (containerCandidates + documentCandidates + matchingAnchorCandidates)
             .mapNotNull { raw -> raw.takeIf(String::isNotBlank)?.let(watchUrl::resolve) }
+            .filterNot { candidate ->
+                TRAILER_HOSTS.any { trailerHost ->
+                    candidate.host == trailerHost || candidate.host.endsWith(".$trailerHost")
+                }
+            }
             .distinctBy(HttpUrl::toString)
 
         println("EgyDead: watch document title=${document.title()}")
@@ -390,5 +405,6 @@ class EgyDead :
     companion object {
         private val DOOD_REGEX = Regex("(do*d(?:stream)?\\.(?:com?|watch|to|s[ho]|cx|la|w[sf]|pm|re|yt|stream))/[de]/([0-9a-zA-Z]+)|ds2play")
         private val STREAMWISH_REGEX = Regex("ajmidyad|alhayabambi|atabknh[ks]|https://.*\\.sbs/e/")
+        private val TRAILER_HOSTS = setOf("youtube.com", "www.youtube.com", "youtu.be", "youtube-nocookie.com")
     }
 }
