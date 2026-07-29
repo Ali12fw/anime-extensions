@@ -23,6 +23,7 @@ import keiyoushi.utils.useAsJsoup
 import okhttp3.FormBody
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
@@ -171,7 +172,7 @@ class EgyDead :
         println("EgyDead: detected host domains=${candidates.map { it.host }.distinct().joinToString()}")
         val videos = candidates.parallelCatchingFlatMap {
             extractVideos(it, playbackHeaders)
-        }.distinctBy { it.videoUrl }
+        }.distinctBy { it.videoUrl to it.quality }
         println("EgyDead: final Video count=${videos.size}")
         return videos
     }
@@ -218,11 +219,9 @@ class EgyDead :
     private suspend fun extractVideos(url: HttpUrl, playbackHeaders: okhttp3.Headers): List<Video> {
         val host = url.host
         val urlString = url.toString()
-        val directMediaPath = url.encodedPath.lowercase()
         println("EgyDead: extracting host=$host")
 
         val route = when {
-            directMediaPath.endsWith(".m3u8") || directMediaPath.endsWith(".mp4") -> "direct"
             MIXDROP_HOSTS.any { host == it || host.endsWith(".$it") } -> "mixdrop"
             host == VOE_HOST || host.endsWith(".$VOE_HOST") -> "voe"
             DOOD_REGEX.containsMatchIn(urlString) || host == DSVPLAY_HOST || host.endsWith(".$DSVPLAY_HOST") -> "dood"
@@ -243,13 +242,12 @@ class EgyDead :
         println("EgyDead: extractor route=$route")
         val videos = try {
             when (route) {
-                "direct" -> listOf(Video(urlString, "Direct", urlString, playbackHeaders))
                 "mixdrop" -> MixDropExtractor(client).videoFromUrl(
                     urlString,
                     referer = playbackHeaders["Referer"].orEmpty(),
                 )
                 "voe" -> voeExtractor.videosFromUrl(urlString)
-                "dood" -> DoodExtractor(client).videoFromUrl(urlString, "Dood mirror")?.let(::listOf).orEmpty()
+                "dood" -> DoodExtractor(client).videoFromUrl(urlString)?.let(::listOf).orEmpty()
                 "streamhide" -> {
                     val request = client.newCall(GET(urlString, playbackHeaders)).awaitSuccess().useAsJsoup()
                     val script = request.selectFirst("script:containsData(sources)")?.data()
@@ -288,8 +286,60 @@ class EgyDead :
             emptyList()
         }
 
-        println("EgyDead: extracted video count=${videos.size}")
-        return videos
+        val acceptedVideos = videos.mapNotNull { validateVideo(it, route) }
+        println("EgyDead: extracted video count=${acceptedVideos.size}")
+        return acceptedVideos
+    }
+
+    private fun validateVideo(video: Video, route: String): Video? {
+        val rawUrl = video.videoUrl
+        val malformedReason = when {
+            rawUrl.isBlank() -> "blank URL"
+            rawUrl.startsWith("/https:", ignoreCase = true) -> "relative /https URL"
+            rawUrl.contains("MDCore", ignoreCase = true) -> "contains MDCore"
+            rawUrl.contains("Core.wurl", ignoreCase = true) -> "contains Core.wurl"
+            rawUrl.startsWith("javascript:", ignoreCase = true) -> "javascript scheme"
+            rawUrl.startsWith("data:", ignoreCase = true) -> "data scheme"
+            rawUrl.startsWith("file:", ignoreCase = true) -> "file scheme"
+            else -> null
+        }
+        if (malformedReason != null) {
+            println("EgyDead: rejected malformed video route=$route reason=$malformedReason")
+            return null
+        }
+
+        val parsedUrl = rawUrl.toHttpUrlOrNull()
+        if (parsedUrl == null || (parsedUrl.scheme != "http" && parsedUrl.scheme != "https")) {
+            println("EgyDead: rejected malformed video route=$route reason=invalid HTTP/HTTPS URL")
+            return null
+        }
+
+        val quality = routeQuality(route, video.quality)
+        val acceptedVideo = Video(
+            url = video.url,
+            quality = quality,
+            videoUrl = video.videoUrl,
+            headers = video.headers,
+            subtitleTracks = video.subtitleTracks,
+            audioTracks = video.audioTracks,
+        )
+        val safeQuality = quality
+            .replace(URL_LOG_REGEX, "<redacted-url>")
+            .replace('\r', ' ')
+            .replace('\n', ' ')
+        println("EgyDead: accepted video route=$route host=${parsedUrl.host} quality=$safeQuality")
+        return acceptedVideo
+    }
+
+    private fun routeQuality(route: String, quality: String): String {
+        val server = ROUTE_LABELS[route] ?: route
+        val detail = when {
+            quality.equals(server, ignoreCase = true) -> "Mirror"
+            quality.startsWith("$server -", ignoreCase = true) -> quality.substring(server.length + 2).trim()
+            quality.startsWith("$server:", ignoreCase = true) -> quality.substring(server.length + 1).trim()
+            else -> quality.trim()
+        }.ifBlank { "Mirror" }
+        return "$server - $detail"
     }
 
     override fun videoListSelector() = listOf(
@@ -442,5 +492,15 @@ class EgyDead :
         private const val VOE_HOST = "voe.sx"
         private const val DSVPLAY_HOST = "dsvplay.com"
         private val TRAILER_HOSTS = setOf("youtube.com", "www.youtube.com", "youtu.be", "youtube-nocookie.com")
+        private val ROUTE_LABELS = mapOf(
+            "mixdrop" to "MixDrop",
+            "voe" to "VOE",
+            "dood" to "Dood",
+            "streamwish" to "StreamWish",
+            "streamhide" to "StreamHide",
+            "fanakishtuna" to "Fanakishtuna",
+            "uqload" to "Uqload",
+        )
+        private val URL_LOG_REGEX = Regex("""https?://\S+""", RegexOption.IGNORE_CASE)
     }
 }
