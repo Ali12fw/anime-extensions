@@ -292,7 +292,7 @@ class EgyDead :
     }
 
     private fun validateVideo(video: Video, route: String): Video? {
-        val rawUrl = video.videoUrl
+        val rawUrl = video.videoUrl.orEmpty()
         val malformedReason = when {
             rawUrl.isBlank() -> "blank URL"
             rawUrl.startsWith("/https:", ignoreCase = true) -> "relative /https URL"
@@ -318,7 +318,7 @@ class EgyDead :
         val acceptedVideo = Video(
             url = video.url,
             quality = quality,
-            videoUrl = video.videoUrl,
+            videoUrl = rawUrl,
             headers = video.headers,
             subtitleTracks = video.subtitleTracks,
             audioTracks = video.audioTracks,
