@@ -1,0 +1,92 @@
+name: Build EgyDead Debug
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/egydead-playback
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+
+      - name: Set up Temurin JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Load only EgyDead
+        shell: pwsh
+        run: |
+          $path = "settings.gradle.kts"
+          $content = [System.IO.File]::ReadAllText($path)
+          $allExtensionsPattern = '(?m)^loadAllIndividualExtensions\(\)\r?$'
+          $examplePattern = '(?m)^// loadIndividualExtension\("all", "jellyfin"\)\r?$'
+
+          if ([regex]::Matches($content, $allExtensionsPattern).Count -ne 1) {
+            throw "Expected exactly one top-level loadAllIndividualExtensions() call"
+          }
+          if ([regex]::Matches($content, $examplePattern).Count -ne 1) {
+            throw "Expected the individual-extension example line"
+          }
+
+          $content = [regex]::Replace(
+            $content,
+            $allExtensionsPattern,
+            "// loadAllIndividualExtensions()"
+          )
+          $content = [regex]::Replace(
+            $content,
+            $examplePattern,
+            'loadIndividualExtension("ar", "egydead")'
+          )
+          [System.IO.File]::WriteAllText(
+            $path,
+            $content,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+          Select-String -Path $path -Pattern "loadAllIndividualExtensions|loadIndividualExtension"
+
+      - name: Build EgyDead debug APK
+        id: build
+        shell: pwsh
+        run: |
+          & .\gradlew.bat :src:ar:egydead:assembleDebug `
+            --no-daemon `
+            --no-configuration-cache `
+            --stacktrace `
+            --console=plain 2>&1 |
+            Tee-Object -FilePath gradle-build-windows.txt
+
+          $buildExitCode = $LASTEXITCODE
+          "exit_code=$buildExitCode" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          exit $buildExitCode
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: egydead-windows-build-log
+          path: gradle-build-windows.txt
+          if-no-files-found: error
+
+      - name: Upload debug APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: egydead-debug-apk
+          path: src/ar/egydead/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
