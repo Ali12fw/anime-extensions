@@ -141,7 +141,7 @@ class EgyDead :
         }
 
         var response = runCatching {
-            client.newCall(POST(watchUrl, playbackHeaders, requestBody)).await()
+            client.newCall(POST(watchUrl.toString(), playbackHeaders, requestBody)).await()
         }.getOrNull()
         println("EgyDead: watch POST HTTP status=${response?.code ?: "request failed"}")
 
