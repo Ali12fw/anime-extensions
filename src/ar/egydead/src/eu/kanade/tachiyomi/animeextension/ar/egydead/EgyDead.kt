@@ -130,6 +130,7 @@ class EgyDead :
             ?: originalUrl.newBuilder().addQueryParameter("view", "watch").build()
         val playbackHeaders = headers.newBuilder()
             .set("Referer", originalUrl.toString())
+            .set("X-Requested-With", "XMLHttpRequest")
             .build()
         val requestBody = FormBody.Builder().add("View", "1").build()
 
@@ -163,8 +164,8 @@ class EgyDead :
         return videos
     }
 
-    private fun parseServerCandidates(document: Document, watchUrl: HttpUrl): List<HttpUrl> = document.select(videoListSelector())
-        .flatMap { server ->
+    private fun parseServerCandidates(document: Document, watchUrl: HttpUrl): List<HttpUrl> {
+        val containerCandidates = document.select(videoListSelector()).flatMap { server ->
             buildList {
                 add(server.attr("data-link"))
                 addAll(server.select("[data-link]").map { it.attr("data-link") })
@@ -172,8 +173,30 @@ class EgyDead :
                 addAll(server.select("a[href]").map { it.attr("href") })
             }
         }
-        .mapNotNull { raw -> raw.takeIf(String::isNotBlank)?.let(watchUrl::resolve) }
-        .distinctBy(HttpUrl::toString)
+        val documentCandidates = document.select("[data-link], [data-video], [data-url], iframe[src]")
+            .flatMap { element ->
+                listOf("data-link", "data-video", "data-url", "href", "src")
+                    .map { attribute -> element.attr(attribute) }
+            }
+        val matchingAnchorCandidates = document.select("a[href]")
+            .map { it.attr("href") }
+            .filter { href ->
+                listOf("player", "embed", "download", "drive", "mp4", "stream")
+                    .any { href.contains(it, ignoreCase = true) }
+            }
+        val candidates = (containerCandidates + documentCandidates + matchingAnchorCandidates)
+            .mapNotNull { raw -> raw.takeIf(String::isNotBlank)?.let(watchUrl::resolve) }
+            .distinctBy(HttpUrl::toString)
+
+        println("EgyDead: watch document title=${document.title()}")
+        println("EgyDead: watch document HTML length=${document.outerHtml().length}")
+        println("EgyDead: watch document [data-link] count=${document.select("[data-link]").size}")
+        println("EgyDead: watch document [data-video] count=${document.select("[data-video]").size}")
+        println("EgyDead: watch document iframe[src] count=${document.select("iframe[src]").size}")
+        println("EgyDead: watch document total candidate count=${candidates.size}")
+        println("EgyDead: watch document detected candidate host domains=${candidates.map { it.host }.distinct().joinToString()}")
+        return candidates
+    }
 
     private suspend fun extractVideos(url: String, playbackHeaders: okhttp3.Headers): List<Video> = when {
         DOOD_REGEX.containsMatchIn(url) -> {
