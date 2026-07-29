@@ -20,6 +20,8 @@ import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parallelCatchingFlatMap
 import keiyoushi.utils.useAsJsoup
 import okhttp3.FormBody
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
@@ -122,32 +124,78 @@ class EgyDead :
     private val streamWishExtractor by lazy { StreamWishExtractor(client, headers) }
 
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
+        val originalUrl = baseUrl.toHttpUrl().resolve(episode.url)
+            ?: return emptyList()
+        val watchUrl = originalUrl.takeIf { it.queryParameter("view") == "watch" }
+            ?: originalUrl.newBuilder().addQueryParameter("view", "watch").build()
+        val playbackHeaders = headers.newBuilder()
+            .set("Referer", originalUrl.toString())
+            .build()
         val requestBody = FormBody.Builder().add("View", "1").build()
 
-        val document = client.newCall(POST(baseUrl + episode.url, body = requestBody))
-            .await()
-            .useAsJsoup()
-        return document.select(videoListSelector()).parallelCatchingFlatMap {
-            val url = it.attr("data-link")
-            extractVideos(url)
+        println("EgyDead: requested watch URL=$watchUrl")
+        runCatching {
+            client.newCall(GET(originalUrl, playbackHeaders)).await().close()
+        }.onFailure {
+            println("EgyDead: initial episode GET failed: ${it.message}")
         }
+
+        var response = runCatching {
+            client.newCall(POST(watchUrl, playbackHeaders, requestBody)).await()
+        }.getOrNull()
+        println("EgyDead: watch POST HTTP status=${response?.code ?: "request failed"}")
+
+        var candidates = response?.use { parseServerCandidates(it.useAsJsoup(), watchUrl) }.orEmpty()
+        if (response?.isSuccessful != true || candidates.isEmpty()) {
+            response = runCatching {
+                client.newCall(GET(watchUrl, playbackHeaders)).await()
+            }.getOrNull()
+            println("EgyDead: watch GET fallback HTTP status=${response?.code ?: "request failed"}")
+            candidates = response?.use { parseServerCandidates(it.useAsJsoup(), watchUrl) }.orEmpty()
+        }
+
+        println("EgyDead: server candidate count=${candidates.size}")
+        println("EgyDead: detected host domains=${candidates.map { it.host }.distinct().joinToString()}")
+        val videos = candidates.parallelCatchingFlatMap {
+            extractVideos(it.toString(), playbackHeaders)
+        }
+        println("EgyDead: final Video count=${videos.size}")
+        return videos
     }
 
-    private suspend fun extractVideos(url: String): List<Video> = when {
+    private fun parseServerCandidates(document: Document, watchUrl: HttpUrl): List<HttpUrl> {
+        return document.select(videoListSelector())
+            .flatMap { server ->
+                buildList {
+                    add(server.attr("data-link"))
+                    addAll(server.select("[data-link]").map { it.attr("data-link") })
+                    addAll(server.select("button[data-link]").map { it.attr("data-link") })
+                    addAll(server.select("a[href]").map { it.attr("href") })
+                }
+            }
+            .mapNotNull { raw -> raw.takeIf(String::isNotBlank)?.let(watchUrl::resolve) }
+            .distinctBy(HttpUrl::toString)
+    }
+
+    private suspend fun extractVideos(url: String, playbackHeaders: okhttp3.Headers): List<Video> = when {
         DOOD_REGEX.containsMatchIn(url) -> {
             DoodExtractor(client).videoFromUrl(url, "Dood mirror")?.let(::listOf)
         }
 
         url.contains("mdbekjwqa") -> {
-            MixDropExtractor(client).videoFromUrl(url)
+            MixDropExtractor(client).videoFromUrl(url, referer = playbackHeaders["Referer"].orEmpty())
         }
 
         url.contains("ahvsh") -> {
-            val request = client.newCall(GET(url, headers)).awaitSuccess().useAsJsoup()
-            val script = request.selectFirst("script:containsData(sources)")!!.data()
-            val streamLink = Regex("sources:\\s*\\[\\{\\s*\\t*file:\\s*[\"']([^\"']+)").find(script)!!.groupValues[1]
-            val quality = Regex("'qualityLabels'\\s*:\\s*\\{\\s*\".*?\"\\s*:\\s*\"(.*?)\"").find(script)!!.groupValues[1]
-            Video(streamLink, "StreamHide: $quality", streamLink).let(::listOf)
+            val request = client.newCall(GET(url, playbackHeaders)).awaitSuccess().useAsJsoup()
+            val script = request.selectFirst("script:containsData(sources)")?.data()
+            val streamLink = script?.let {
+                Regex("sources:\\s*\\[\\{\\s*\\t*file:\\s*[\"']([^\"']+)").find(it)?.groupValues?.getOrNull(1)
+            }
+            val quality = script?.let {
+                Regex("'qualityLabels'\\s*:\\s*\\{\\s*\".*?\"\\s*:\\s*\"(.*?)\"").find(it)?.groupValues?.getOrNull(1)
+            } ?: "Mirror"
+            streamLink?.let { listOf(Video(it, "StreamHide: $quality", it, playbackHeaders)) }.orEmpty()
         }
 
         STREAMWISH_REGEX.containsMatchIn(url) -> {
@@ -155,24 +203,34 @@ class EgyDead :
         }
 
         url.contains("fanakishtuna") -> {
-            val request = client.newCall(GET(url, headers)).awaitSuccess().useAsJsoup()
-            val data = request.selectFirst("script:containsData(sources)")!!.data()
-            val streamLink = Regex("sources:\\s*\\[\\{\\s*\\t*file:\\s*[\"']([^\"']+)").find(data)!!.groupValues[1]
-            listOf(Video(streamLink, "Mirror: High Quality", streamLink))
+            val request = client.newCall(GET(url, playbackHeaders)).awaitSuccess().useAsJsoup()
+            val data = request.selectFirst("script:containsData(sources)")?.data()
+            val streamLink = data?.let {
+                Regex("sources:\\s*\\[\\{\\s*\\t*file:\\s*[\"']([^\"']+)").find(it)?.groupValues?.getOrNull(1)
+            }
+            streamLink?.let { listOf(Video(it, "Mirror: High Quality", it, playbackHeaders)) }.orEmpty()
         }
 
         url.contains("uqload") -> {
             val newURL = url.replace("https://uqload.co/", "https://www.uqload.co/")
-            val request = client.newCall(GET(newURL, headers)).awaitSuccess().useAsJsoup()
-            val data = request.selectFirst("script:containsData(sources)")!!.data()
-            val streamLink = data.substringAfter("sources: [\"").substringBefore("\"]")
-            listOf(Video(streamLink, "Uqload: Mirror", streamLink))
+            val request = client.newCall(GET(newURL, playbackHeaders)).awaitSuccess().useAsJsoup()
+            val data = request.selectFirst("script:containsData(sources)")?.data()
+            val streamLink = data?.substringAfter("sources: [\"", "")?.substringBefore("\"]", "")
+                ?.takeIf(String::isNotBlank)
+            streamLink?.let { listOf(Video(it, "Uqload: Mirror", it, playbackHeaders)) }.orEmpty()
         }
 
         else -> null
     } ?: emptyList()
 
-    override fun videoListSelector() = "ul.serversList li"
+    override fun videoListSelector() = listOf(
+        "ul.serversList li",
+        "ul.servers-list li",
+        "div.serversList li",
+        "div.servers-list li",
+        "ul.donwload-servers-list li",
+        "ul.download-servers-list li",
+    ).joinToString(", ")
 
     override fun videoFromElement(element: Element) = throw UnsupportedOperationException()
 
