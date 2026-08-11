@@ -1,0 +1,16 @@
+ext {
+    extName = 'Top Cinema'
+    extClass = '.TopCinema'
+    extVersionCode = 5
+}
+
+apply plugin: "kei.plugins.extension.legacy"
+
+dependencies {
+    implementation(project(':lib:doodextractor'))
+    implementation(project(':lib:filemoonextractor'))
+    implementation(project(':lib:mixdropextractor'))
+    implementation(project(':lib:playlistutils'))
+    implementation(project(':lib:unpacker'))
+    implementation(project(':lib:vidhideextractor'))
+}
