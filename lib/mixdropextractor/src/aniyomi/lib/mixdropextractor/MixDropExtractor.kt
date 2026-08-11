@@ -4,13 +4,16 @@ import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
-import keiyoushi.lib.unpacker.Unpacker
+import keiyoushi.lib.autoUnpacker
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import java.net.URLDecoder
 
-class MixDropExtractor(private val client: OkHttpClient) {
+class MixDropExtractor(
+    private val client: OkHttpClient,
+    private val headers: Headers = Headers.EMPTY,
+) {
     fun videoFromUrl(
         url: String,
         lang: String = "",
@@ -19,19 +22,17 @@ class MixDropExtractor(private val client: OkHttpClient) {
         referer: String = DEFAULT_REFERER,
     ): List<Video> {
         val requestUrl = url.replaceFirst("/f/", "/e/")
-        val requestHeaders = Headers.headersOf(
-            "Referer",
-            referer,
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-        )
+        val requestHeaders = headers.newBuilder()
+            .set("Referer", referer)
+            .set("User-Agent", headers["User-Agent"] ?: DEFAULT_USER_AGENT)
+            .build()
         val (document, pageUrl) = client.newCall(GET(requestUrl, requestHeaders)).execute().use { response ->
             response.asJsoup() to response.request.url.toString()
         }
         val unpacked = document.select("script")
             .asSequence()
-            .map { it.data() }
-            .map { script -> runCatching { Unpacker.unpack(script) }.getOrDefault("").ifBlank { script } }
+            .map { it.html() }
+            .map { script -> autoUnpacker(script).orEmpty().ifBlank { script } }
             .firstOrNull(WURL_REGEX::containsMatchIn)
             ?: return emptyList()
 
@@ -52,6 +53,7 @@ class MixDropExtractor(private val client: OkHttpClient) {
 
         val videoHeaders = requestHeaders.newBuilder()
             .set("Referer", pageUrl)
+            .set("Origin", pageUrl.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}" }.orEmpty())
             .build()
         return listOf(Video(videoUrl, quality, videoUrl, headers = videoHeaders, subtitleTracks = subs + externalSubs))
     }
@@ -96,3 +98,6 @@ class MixDropExtractor(private val client: OkHttpClient) {
 }
 
 private const val DEFAULT_REFERER = "https://mixdrop.co/"
+private const val DEFAULT_USER_AGENT =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
